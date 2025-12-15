@@ -11,9 +11,9 @@ st.set_page_config(page_title="Cotizador DaaS", layout="wide")
 
 DEFAULT_ITEMS = pd.DataFrame(
     [
-        {"Tipo": "Laptop", "Nombre": "Laptop Perfil 1", "Cantidad": 1, "Costo_unit": 3000.0, "Spare_unit": 0.0},
-        {"Tipo": "Monitor", "Nombre": "Monitor", "Cantidad": 1, "Costo_unit": 800.0, "Spare_unit": 0.0},
-        {"Tipo": "Servicios", "Nombre": "Servicios cotizados", "Cantidad": 1, "Costo_unit": 500.0, "Spare_unit": 0.0},
+        {"Tipo": "Laptop", "Nombre": "Laptop Perfil 1", "Cantidad": 10, "Costo_unit": 3000.0, "Spare_unit": 0.0},
+        {"Tipo": "Monitor", "Nombre": "Monitor", "Cantidad": 10, "Costo_unit": 800.0, "Spare_unit": 0.0},
+        {"Tipo": "Servicios", "Nombre": "Servicios cotizados", "Cantidad": 10, "Costo_unit": 500.0, "Spare_unit": 0.0},
     ]
 )
 
@@ -53,7 +53,8 @@ def compute_items(items: pd.DataFrame) -> pd.DataFrame:
     df["Cantidad"] = df["Cantidad"].apply(lambda v: max(_as_int(v, 0), 0))
     df["Costo_unit"] = df["Costo_unit"].apply(lambda v: max(_as_float(v, 0.0), 0.0))
     df["Spare_unit"] = df["Spare_unit"].apply(lambda v: max(_as_float(v, 0.0), 0.0))
-    df["Costo_total"] = (df["Costo_unit"] + df["Spare_unit"]) * df["Cantidad"]
+    df["Costo_unit_total"] = df["Costo_unit"] + df["Spare_unit"]
+    df["Costo_total"] = df["Costo_unit_total"] * df["Cantidad"]
     return df
 
 def funding_payment(cost_equipos: float, p: Params):
@@ -119,6 +120,7 @@ def npv_monthly(rate: float, cashflows: np.ndarray) -> float:
     return float(cashflows[0] + npf.npv(rate, cashflows[1:]))
 
 def solve_canon(cost_equipos: float, p: Params):
+    """Busca canon tal que NPV(tasa_objetivo)=0."""
     cost_equipos = float(max(cost_equipos, 0.0))
     if cost_equipos <= 0:
         cf = cashflows_for_canon(0.0, cost_equipos, p)
@@ -185,7 +187,7 @@ def export_excel(items_calc: pd.DataFrame, cashflows: pd.DataFrame, params: Para
     return bio.getvalue()
 
 # ---------------- UI ----------------
-st.title("Cotizador DaaS (canon mensual por tasa objetivo)")
+st.title("Cotizador DaaS (canon mensual por ítem)")
 
 with st.sidebar:
     st.header("Parámetros (mensuales)")
@@ -254,43 +256,59 @@ edited = st.data_editor(
 st.session_state["items"] = edited
 
 items_calc = compute_items(st.session_state["items"])
-cost_equipos = float(items_calc["Costo_total"].sum())
 
-canon, cashflows, npv_at_target = solve_canon(cost_equipos, params)
+# ---- Canon por ítem (unitario) ----
+canon_units = []
+for _, row in items_calc.iterrows():
+    unit_cost = float(row["Costo_unit_total"])
+    if unit_cost <= 0:
+        canon_units.append(0.0)
+        continue
+    canon_u, _, _ = solve_canon(unit_cost, params)   # goal-seek por unidad
+    canon_units.append(canon_u)
 
-pago_fondeo, residual_fon = funding_payment(cost_equipos, params)
-residual_rec = cost_equipos * params.residual_rec_pct
+items_calc["Canon_unit_mensual"] = canon_units
+items_calc["Canon_total_mensual"] = items_calc["Canon_unit_mensual"] * items_calc["Cantidad"]
 
+total_cost = float(items_calc["Costo_total"].sum())
+total_canon = float(items_calc["Canon_total_mensual"].sum())
+
+# Flujos agregados (equivalente a sumar flujos por item, por linealidad)
+canon_calc, cashflows, npv_at_target = solve_canon(total_cost, params)
+# Forzamos canon total como suma por item para mostrar consistencia visual
+cashflows = cashflows_for_canon(total_canon, total_cost, params)
 cf = cashflows["Flujo_neto"].to_numpy(dtype=float)
+npv_at_target = npv_monthly(params.tasa_objetivo, cf)
+
+pago_fondeo, residual_fon = funding_payment(total_cost, params)
+residual_rec = total_cost * params.residual_rec_pct
+
 irr_m = float(npf.irr(cf)) if (np.any(cf != 0) and len(cf) >= 2) else 0.0
 irr_ea = (1.0 + irr_m) ** 12 - 1.0 if irr_m > -1 else float("nan")
 
 kpis = {
-    "Costo_equipos": cost_equipos,
-    "Canon_mensual": canon,
+    "Costo_total_equipos": total_cost,
+    "Canon_total_mensual": total_canon,
     "Pago_mensual_fondeo": pago_fondeo,
-    "Residual_recuperacion": residual_rec,
-    "Residual_fondeo": residual_fon,
     "NPV_a_tasa_objetivo": npv_at_target,
     "IRR_mensual": irr_m,
     "IRR_EA": irr_ea,
+    "Residual_recuperacion_total": residual_rec,
+    "Residual_fondeo_total": residual_fon,
 }
 
-st.subheader("Indicadores")
+st.subheader("Indicadores (total)")
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Costo equipos", f"${cost_equipos:,.0f}")
-c2.metric("Canon mensual (calculado)", f"${canon:,.0f}")
+c1.metric("Costo total equipos", f"${total_cost:,.0f}")
+c2.metric("Canon total mensual", f"${total_canon:,.0f}")
 c3.metric("Pago mensual fondeo", f"${pago_fondeo:,.0f}")
 c4.metric("NPV a tasa objetivo", f"${npv_at_target:,.0f}")
 
-c5, c6, c7 = st.columns(3)
-c5.metric("IRR mensual (flujo neto)", f"{irr_m*100:.2f}%")
-c6.metric("IRR E.A.", f"{irr_ea*100:.2f}%")
-c7.metric("Recuperación final (activo)", f"${residual_rec:,.0f}")
+st.caption("Nota: el canon unitario se calcula con goal-seek por unidad. El canon total es la suma: canon_unit * cantidad.")
 
 st.divider()
 
-tab1, tab2, tab3 = st.tabs(["Detalle Ítems", "Flujos de caja", "Descargar Excel"])
+tab1, tab2, tab3 = st.tabs(["Detalle Ítems (canon por ítem)", "Flujos de caja (total)", "Descargar Excel"])
 
 with tab1:
     st.dataframe(items_calc, use_container_width=True)
@@ -304,8 +322,8 @@ with tab3:
     st.download_button(
         "⬇️ Descargar Excel (Items + Cashflows + Parametros)",
         data=xlsx_bytes,
-        file_name="cotizacion_daas_canon.xlsx",
+        file_name="cotizacion_daas_canon_por_item.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-st.caption("El canon se calcula haciendo goal-seek para que NPV(tasa objetivo)=0 con los costos/egresos definidos.")
+st.caption("Si necesitas que algunos ítems tengan parámetros distintos (residual, mtto, seguro), te agrego columnas por ítem y el canon se recalcula con esos valores.")
