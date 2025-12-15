@@ -11,9 +11,9 @@ st.set_page_config(page_title="Cotizador DaaS", layout="wide")
 
 DEFAULT_ITEMS = pd.DataFrame(
     [
-        {"Tipo": "Laptop", "Nombre": "Laptop Perfil 1", "Cantidad": 1, "Costo_unit": 100.0, "Spare_unit": 0.0},
-        {"Tipo": "Monitor", "Nombre": "Monitor", "Cantidad": 1, "Costo_unit": 50.0, "Spare_unit": 0.0},
-        {"Tipo": "Servicios", "Nombre": "Servicios cotizados", "Cantidad": 1, "Costo_unit": 50.0, "Spare_unit": 0.0},
+        {"Tipo": "Laptop", "Nombre": "Laptop Perfil 1", "Cantidad": 1, "Costo_unit": 3000.0, "Spare_unit": 0.0},
+        {"Tipo": "Monitor", "Nombre": "Monitor", "Cantidad": 1, "Costo_unit": 800.0, "Spare_unit": 0.0},
+        {"Tipo": "Servicios", "Nombre": "Servicios cotizados", "Cantidad": 1, "Costo_unit": 500.0, "Spare_unit": 0.0},
     ]
 )
 
@@ -36,114 +36,79 @@ def _as_int(x, default=0):
 @dataclass
 class Params:
     plazo_meses: int
-    margen: float
-    iva_venta: float
-    residual_pct: float
-    tasa_coloc: float
-    tasa_capt: float
+    tasa_objetivo: float   # retorno objetivo (mensual) para calcular canon
+    tasa_capt: float       # fondeo (mensual)
+
+    residual_rec_pct: float  # recuperación activo (ingreso final)
+    residual_fon_pct: float  # balloon fondeo (egreso final)
+
     mantenimiento_pct: float
     seguros_pct: float
     provision_pct: float
     ica_pct: float
     renta_pct: float
-    descuento: float
 
-def compute_quote(items: pd.DataFrame, p: Params):
+def compute_items(items: pd.DataFrame) -> pd.DataFrame:
     df = items.copy()
     df["Cantidad"] = df["Cantidad"].apply(lambda v: max(_as_int(v, 0), 0))
     df["Costo_unit"] = df["Costo_unit"].apply(lambda v: max(_as_float(v, 0.0), 0.0))
     df["Spare_unit"] = df["Spare_unit"].apply(lambda v: max(_as_float(v, 0.0), 0.0))
-
     df["Costo_total"] = (df["Costo_unit"] + df["Spare_unit"]) * df["Cantidad"]
+    return df
 
-    denom = max(1e-9, (1.0 - p.margen))
-    df["Venta_sin_IVA_unit"] = (df["Costo_unit"] + df["Spare_unit"]) / denom
-    df["IVA_unit"] = df["Venta_sin_IVA_unit"] * p.iva_venta
-    df["Venta_con_IVA_unit"] = df["Venta_sin_IVA_unit"] + df["IVA_unit"]
-    df["Venta_total"] = df["Venta_con_IVA_unit"] * df["Cantidad"]
-
-    total_costo = float(df["Costo_total"].sum())
-    total_venta = float(df["Venta_total"].sum())
-
+def funding_payment(cost_equipos: float, p: Params):
     n = int(max(p.plazo_meses, 1))
+    pv = float(max(cost_equipos, 0.0))
+    residual = pv * float(max(p.residual_fon_pct, 0.0))
+    fv = -residual
+    if pv <= 0:
+        return 0.0, 0.0
+    pago = float(-npf.pmt(p.tasa_capt, n, pv, fv))
+    return pago, residual
 
-    pv_cli = total_venta
-    fv_cli = -pv_cli * p.residual_pct
-    canon_mensual = float(-npf.pmt(p.tasa_coloc, n, pv_cli, fv_cli)) if pv_cli > 0 else 0.0
-    residual_cli = pv_cli * p.residual_pct if pv_cli > 0 else 0.0
-
-    pv_bank = total_costo
-    fv_bank = -pv_bank * p.residual_pct
-    costo_fondeo_mensual = float(-npf.pmt(p.tasa_capt, n, pv_bank, fv_bank)) if pv_bank > 0 else 0.0
-    residual_bank = pv_bank * p.residual_pct if pv_bank > 0 else 0.0
-
-    summary = {
-        "Costo_equipos": total_costo,
-        "Venta_total_con_IVA": total_venta,
-        "Canon_mensual_cliente": canon_mensual,
-        "Residual_cliente": residual_cli,
-        "Pago_mensual_fondeo": costo_fondeo_mensual,
-        "Residual_fondeo": residual_bank,
-    }
-    return df, summary
-
-def compute_cashflows(summary: dict, p: Params) -> pd.DataFrame:
+def cashflows_for_canon(canon: float, cost_equipos: float, p: Params) -> pd.DataFrame:
     n = int(max(p.plazo_meses, 1))
+    canon = float(max(canon, 0.0))
+    cost_equipos = float(max(cost_equipos, 0.0))
 
-    canon = float(summary["Canon_mensual_cliente"])
-    resid_cli = float(summary["Residual_cliente"])
-    pago_fondeo = float(summary["Pago_mensual_fondeo"])
-    resid_fondeo = float(summary["Residual_fondeo"])
-    costo_equipos = float(summary["Costo_equipos"])
+    pago_fondeo, residual_fondeo = funding_payment(cost_equipos, p)
+    residual_rec = cost_equipos * float(max(p.residual_rec_pct, 0.0))
 
-    months = list(range(0, n + 1))
     rows = []
-    for m in months:
+    for m in range(0, n + 1):
         if m == 0:
-            rows.append({
-                "Mes": 0,
-                "Cobro_cliente": 0.0,
-                "Cobro_residual": 0.0,
-                "Pago_fondeo": 0.0,
-                "Pago_residual": 0.0,
-                "Spread": 0.0,
-                "Op_costos": 0.0,
-                "Provision": 0.0,
-                "ICA": 0.0,
-                "Utilidad_AI": 0.0,
-                "Impuesto": 0.0,
-                "Flujo_neto": -costo_equipos,
-            })
+            rows.append({"Mes": 0, "Flujo_neto": -cost_equipos})
             continue
 
         cobro = canon
-        cobro_res = resid_cli if m == n else 0.0
+        cobro_res = residual_rec if m == n else 0.0
 
         pago = pago_fondeo
-        pago_res = resid_fondeo if m == n else 0.0
+        pago_res = residual_fondeo if m == n else 0.0
 
         spread = (cobro + cobro_res) - (pago + pago_res)
 
-        op = (costo_equipos * (p.mantenimiento_pct + p.seguros_pct) / n) if costo_equipos > 0 else 0.0
+        op = (cost_equipos * (p.mantenimiento_pct + p.seguros_pct) / n) if cost_equipos > 0 else 0.0
         prov = max(0.0, spread) * p.provision_pct
         ica = max(0.0, (cobro + cobro_res)) * p.ica_pct
 
         utilidad_ai = spread - op - prov - ica
         impuesto = max(0.0, utilidad_ai) * p.renta_pct
+        flujo = utilidad_ai - impuesto
 
         rows.append({
             "Mes": m,
             "Cobro_cliente": cobro,
-            "Cobro_residual": cobro_res,
+            "Cobro_residual_rec": cobro_res,
             "Pago_fondeo": pago,
-            "Pago_residual": pago_res,
+            "Pago_residual_fon": pago_res,
             "Spread": spread,
             "Op_costos": op,
             "Provision": prov,
             "ICA": ica,
             "Utilidad_AI": utilidad_ai,
             "Impuesto": impuesto,
-            "Flujo_neto": utilidad_ai - impuesto,
+            "Flujo_neto": flujo,
         })
 
     return pd.DataFrame(rows)
@@ -153,60 +118,86 @@ def npv_monthly(rate: float, cashflows: np.ndarray) -> float:
         return 0.0
     return float(cashflows[0] + npf.npv(rate, cashflows[1:]))
 
-def export_excel(items_calc: pd.DataFrame, cashflows: pd.DataFrame, params: Params, summary: dict) -> bytes:
+def solve_canon(cost_equipos: float, p: Params):
+    cost_equipos = float(max(cost_equipos, 0.0))
+    if cost_equipos <= 0:
+        cf = cashflows_for_canon(0.0, cost_equipos, p)
+        return 0.0, cf, 0.0
+
+    def f(c):
+        cf = cashflows_for_canon(c, cost_equipos, p)
+        arr = cf["Flujo_neto"].to_numpy(dtype=float)
+        return npv_monthly(p.tasa_objetivo, arr)
+
+    lo = 0.0
+    hi = max(1.0, cost_equipos / max(p.plazo_meses, 1))
+    f_hi = f(hi)
+
+    guard = 0
+    while f_hi <= 0 and guard < 60:
+        hi *= 1.6
+        f_hi = f(hi)
+        guard += 1
+
+    if f_hi <= 0:
+        cf = cashflows_for_canon(hi, cost_equipos, p)
+        arr = cf["Flujo_neto"].to_numpy(dtype=float)
+        return hi, cf, npv_monthly(p.tasa_objetivo, arr)
+
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        f_mid = f(mid)
+        if abs(f_mid) < 1e-6:
+            lo = hi = mid
+            break
+        if f_mid > 0:
+            hi = mid
+        else:
+            lo = mid
+
+    canon = (lo + hi) / 2
+    cf = cashflows_for_canon(canon, cost_equipos, p)
+    arr = cf["Flujo_neto"].to_numpy(dtype=float)
+    return canon, cf, npv_monthly(p.tasa_objetivo, arr)
+
+def export_excel(items_calc: pd.DataFrame, cashflows: pd.DataFrame, params: Params, kpis: dict) -> bytes:
     wb = Workbook()
     ws1 = wb.active
-    ws1.title = "Quote"
+    ws1.title = "Items"
     ws2 = wb.create_sheet("Cashflows")
     ws3 = wb.create_sheet("Parametros")
 
     for r in dataframe_to_rows(items_calc, index=False, header=True):
         ws1.append(r)
-
     for r in dataframe_to_rows(cashflows, index=False, header=True):
         ws2.append(r)
 
     ws3.append(["Parametro", "Valor"])
-    for k, v in {
-        "plazo_meses": params.plazo_meses,
-        "margen": params.margen,
-        "iva_venta": params.iva_venta,
-        "residual_pct": params.residual_pct,
-        "tasa_coloc_mensual": params.tasa_coloc,
-        "tasa_capt_mensual": params.tasa_capt,
-        "mantenimiento_pct": params.mantenimiento_pct,
-        "seguros_pct": params.seguros_pct,
-        "provision_pct": params.provision_pct,
-        "ica_pct": params.ica_pct,
-        "renta_pct": params.renta_pct,
-        "tasa_descuento_mensual": params.descuento,
-    }.items():
+    for k, v in params.__dict__.items():
         ws3.append([k, float(v)])
-
     ws3.append([])
-    ws3.append(["Resumen", ""])
-    for k, v in summary.items():
-        ws3.append([k, float(v)])
+    ws3.append(["KPIs", ""])
+    for k, v in kpis.items():
+        ws3.append([k, float(v) if isinstance(v, (int, float, np.floating)) else v])
 
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
 
-st.title("Cotizador DaaS (Streamlit)")
+# ---------------- UI ----------------
+st.title("Cotizador DaaS (canon mensual por tasa objetivo)")
 
 with st.sidebar:
-    st.header("Parámetros")
+    st.header("Parámetros (mensuales)")
     plazo_meses = st.number_input("Plazo (meses)", min_value=1, max_value=120, value=36, step=1)
 
     colA, colB = st.columns(2)
     with colA:
-        margen = st.number_input("Margen (ej: 0.05)", min_value=0.0, max_value=0.9, value=0.05, step=0.01, format="%.4f")
-        residual_pct = st.number_input("Residual % (ej: 0.15)", min_value=0.0, max_value=0.9, value=0.15, step=0.01, format="%.4f")
-        iva_venta = st.number_input("IVA venta (ej: 0.19)", min_value=0.0, max_value=0.5, value=0.19, step=0.01, format="%.4f")
+        tasa_obj = st.number_input("Tasa objetivo negocio (mensual)", min_value=0.0, max_value=0.5, value=0.026, step=0.001, format="%.4f")
+        tasa_capt = st.number_input("Tasa captación / fondeo (mensual)", min_value=0.0, max_value=0.5, value=0.006, step=0.001, format="%.4f")
     with colB:
-        tasa_coloc = st.number_input("Tasa colocación mensual (ej: 0.026)", min_value=0.0, max_value=0.5, value=0.026, step=0.001, format="%.4f")
-        tasa_capt = st.number_input("Tasa captación mensual (ej: 0.006)", min_value=0.0, max_value=0.5, value=0.006, step=0.001, format="%.4f")
-        descuento = st.number_input("Tasa descuento mensual (NPV)", min_value=0.0, max_value=0.5, value=float(tasa_capt), step=0.001, format="%.4f")
+        residual_rec_pct = st.number_input("Recuperación activo % (ingreso final)", min_value=0.0, max_value=0.9, value=0.15, step=0.01, format="%.4f")
+        residual_fon_pct = st.number_input("Residual fondeo % (balloon egreso final)", min_value=0.0, max_value=0.9, value=0.15, step=0.01, format="%.4f")
 
     st.divider()
     st.subheader("Costos / riesgos")
@@ -223,21 +214,18 @@ with st.sidebar:
 
 params = Params(
     plazo_meses=int(plazo_meses),
-    margen=float(margen),
-    iva_venta=float(iva_venta),
-    residual_pct=float(residual_pct),
-    tasa_coloc=float(tasa_coloc),
+    tasa_objetivo=float(tasa_obj),
     tasa_capt=float(tasa_capt),
+    residual_rec_pct=float(residual_rec_pct),
+    residual_fon_pct=float(residual_fon_pct),
     mantenimiento_pct=float(mantenimiento_pct),
     seguros_pct=float(seguros_pct),
     provision_pct=float(provision_pct),
     ica_pct=float(ica_pct),
     renta_pct=float(renta_pct),
-    descuento=float(descuento),
 )
 
-st.subheader("Ítems de la cotización")
-
+st.subheader("Ítems (agrega infinitos)")
 if "items" not in st.session_state:
     st.session_state["items"] = DEFAULT_ITEMS.copy()
 
@@ -259,35 +247,50 @@ edited = st.data_editor(
     hide_index=True,
     column_config={
         "Cantidad": st.column_config.NumberColumn(min_value=0, step=1),
-        "Costo_unit": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.2f"),
-        "Spare_unit": st.column_config.NumberColumn(min_value=0.0, step=1.0, format="%.2f"),
+        "Costo_unit": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.2f"),
+        "Spare_unit": st.column_config.NumberColumn(min_value=0.0, step=10.0, format="%.2f"),
     },
 )
 st.session_state["items"] = edited
 
-items_calc, summary = compute_quote(st.session_state["items"], params)
-cashflows = compute_cashflows(summary, params)
+items_calc = compute_items(st.session_state["items"])
+cost_equipos = float(items_calc["Costo_total"].sum())
 
-st.subheader("Indicadores")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Costo equipos", f"${summary['Costo_equipos']:,.0f}")
-c2.metric("Venta total (con IVA)", f"${summary['Venta_total_con_IVA']:,.0f}")
-c3.metric("Canon mensual (cliente)", f"${summary['Canon_mensual_cliente']:,.0f}")
-c4.metric("Pago mensual fondeo", f"${summary['Pago_mensual_fondeo']:,.0f}")
+canon, cashflows, npv_at_target = solve_canon(cost_equipos, params)
+
+pago_fondeo, residual_fon = funding_payment(cost_equipos, params)
+residual_rec = cost_equipos * params.residual_rec_pct
 
 cf = cashflows["Flujo_neto"].to_numpy(dtype=float)
 irr_m = float(npf.irr(cf)) if (np.any(cf != 0) and len(cf) >= 2) else 0.0
 irr_ea = (1.0 + irr_m) ** 12 - 1.0 if irr_m > -1 else float("nan")
-npv = npv_monthly(params.descuento, cf)
+
+kpis = {
+    "Costo_equipos": cost_equipos,
+    "Canon_mensual": canon,
+    "Pago_mensual_fondeo": pago_fondeo,
+    "Residual_recuperacion": residual_rec,
+    "Residual_fondeo": residual_fon,
+    "NPV_a_tasa_objetivo": npv_at_target,
+    "IRR_mensual": irr_m,
+    "IRR_EA": irr_ea,
+}
+
+st.subheader("Indicadores")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Costo equipos", f"${cost_equipos:,.0f}")
+c2.metric("Canon mensual (calculado)", f"${canon:,.0f}")
+c3.metric("Pago mensual fondeo", f"${pago_fondeo:,.0f}")
+c4.metric("NPV a tasa objetivo", f"${npv_at_target:,.0f}")
 
 c5, c6, c7 = st.columns(3)
-c5.metric("NPV (mensual)", f"${npv:,.0f}")
-c6.metric("IRR mensual", f"{irr_m*100:.2f}%")
-c7.metric("IRR E.A.", f"{irr_ea*100:.2f}%")
+c5.metric("IRR mensual (flujo neto)", f"{irr_m*100:.2f}%")
+c6.metric("IRR E.A.", f"{irr_ea*100:.2f}%")
+c7.metric("Recuperación final (activo)", f"${residual_rec:,.0f}")
 
 st.divider()
 
-tab1, tab2, tab3 = st.tabs(["Detalle Quote", "Flujos de caja", "Descargar Excel"])
+tab1, tab2, tab3 = st.tabs(["Detalle Ítems", "Flujos de caja", "Descargar Excel"])
 
 with tab1:
     st.dataframe(items_calc, use_container_width=True)
@@ -297,12 +300,12 @@ with tab2:
     st.line_chart(cashflows.set_index("Mes")["Flujo_neto"].cumsum())
 
 with tab3:
-    xlsx_bytes = export_excel(items_calc, cashflows, params, summary)
+    xlsx_bytes = export_excel(items_calc, cashflows, params, kpis)
     st.download_button(
-        "⬇️ Descargar Excel (Quote + Cashflows + Parametros)",
+        "⬇️ Descargar Excel (Items + Cashflows + Parametros)",
         data=xlsx_bytes,
-        file_name="cotizacion_daas.xlsx",
+        file_name="cotizacion_daas_canon.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-st.caption("Modelo inspirado en tu template: margen para venta, PMT con residual, y flujo neto después de costos, provisión, ICA e impuestos.")
+st.caption("El canon se calcula haciendo goal-seek para que NPV(tasa objetivo)=0 con los costos/egresos definidos.")
