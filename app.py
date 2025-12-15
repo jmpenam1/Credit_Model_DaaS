@@ -12,8 +12,6 @@ st.set_page_config(page_title="Cotizador DaaS", layout="wide")
 DEFAULT_ITEMS = pd.DataFrame(
     [
         {"Tipo": "Laptop", "Nombre": "Laptop Perfil 1", "Cantidad": 10, "Costo_unit": 3000.0, "Spare_unit": 0.0},
-        {"Tipo": "Monitor", "Nombre": "Monitor", "Cantidad": 10, "Costo_unit": 800.0, "Spare_unit": 0.0},
-        {"Tipo": "Servicios", "Nombre": "Servicios cotizados", "Cantidad": 10, "Costo_unit": 500.0, "Spare_unit": 0.0},
     ]
 )
 
