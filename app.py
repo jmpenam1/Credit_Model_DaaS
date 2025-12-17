@@ -34,11 +34,11 @@ def _as_int(x, default=0):
 @dataclass
 class Params:
     plazo_meses: int
-    tasa_objetivo: float   # retorno objetivo (mensual) para calcular canon
+    tasa_objetivo: float  
     tasa_capt: float       # fondeo (mensual)
 
-    residual_rec_pct: float  # recuperación activo (ingreso final)
-    residual_fon_pct: float  # balloon fondeo (egreso final)
+    residual_rec_pct: float 
+    residual_fon_pct: float  
 
     mantenimiento_pct: float
     seguros_pct: float
@@ -262,7 +262,7 @@ for _, row in items_calc.iterrows():
     if unit_cost <= 0:
         canon_units.append(0.0)
         continue
-    canon_u, _, _ = solve_canon(unit_cost, params)   # goal-seek por unidad
+    canon_u, _, _ = solve_canon(unit_cost, params)   
     canon_units.append(canon_u)
 
 items_calc["Canon_unit_mensual"] = canon_units
@@ -271,7 +271,7 @@ items_calc["Canon_total_mensual"] = items_calc["Canon_unit_mensual"] * items_cal
 total_cost = float(items_calc["Costo_total"].sum())
 total_canon = float(items_calc["Canon_total_mensual"].sum())
 
-# Flujos agregados (equivalente a sumar flujos por item, por linealidad)
+# Flujos agregados 
 canon_calc, cashflows, npv_at_target = solve_canon(total_cost, params)
 # Forzamos canon total como suma por item para mostrar consistencia visual
 cashflows = cashflows_for_canon(total_canon, total_cost, params)
